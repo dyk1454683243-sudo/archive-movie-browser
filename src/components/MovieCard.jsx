@@ -1,73 +1,50 @@
 import React, { useState, useEffect, memo } from 'react';
-import { Clock, Download, Star, ExternalLink, Play, Film, Image as ImageIcon } from 'lucide-react';
+import { Clock, Download, Star, ExternalLink, Play, Image as ImageIcon } from 'lucide-react';
 import tmdbService from '../services/tmdb';
 import archiveService from '../services/archive';
+import TitleCover from './TitleCover';
 
-const MovieCard = memo(function MovieCard({ movie, tmdbEnabled = false, viewMode = 'grid', onPlay, onImageStatus, onTmdbData }) {
+const MovieCard = memo(function MovieCard({ movie, viewMode = 'grid', onPlay }) {
   const [tmdbData, setTmdbData] = useState(null);
   const [tmdbChecked, setTmdbChecked] = useState(false);
   const [posterLoaded, setPosterLoaded] = useState(false);
   const [posterError, setPosterError] = useState(false);
   const [isHovered, setIsHovered] = useState(false);
-  const [statusReported, setStatusReported] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
 
-    if (tmdbEnabled && movie.title && !tmdbChecked) {
-      tmdbService.searchMovie(movie.title, movie.year).then(data => {
+    // Always ask: the poster index can answer even when there is no TMDB key
+    if (movie.title && !tmdbChecked) {
+      tmdbService.searchMovie(movie.title, movie.year, movie.identifier).then(data => {
         if (cancelled) return;
         setTmdbData(data);
         setTmdbChecked(true);
       });
-    } else if (!tmdbEnabled && !tmdbChecked) {
-      setTmdbChecked(true);
     }
 
     return () => { cancelled = true; };
-  }, [movie.title, movie.year, tmdbEnabled, tmdbChecked]);
-
-  // Report TMDB data once when checked (separate effect to avoid loops)
-  useEffect(() => {
-    if (!tmdbChecked || statusReported) return;
-
-    if (tmdbData) {
-      onTmdbData?.(tmdbData);
-      if (tmdbData.posterPath) {
-        onImageStatus?.(true);
-      } else {
-        onImageStatus?.(false);
-      }
-    } else if (tmdbChecked) {
-      onImageStatus?.(false);
-    }
-    setStatusReported(true);
-  }, [tmdbChecked, tmdbData, statusReported]);
+  }, [movie.title, movie.year, movie.identifier, tmdbChecked]);
 
   // Determine which poster to use
   const tmdbPosterUrl = tmdbData?.posterPath
     ? tmdbService.getPosterUrl(tmdbData.posterPath, 'medium')
     : null;
 
-  const archiveThumbnailUrl = movie.thumbnailUrl;
-  const posterUrl = tmdbPosterUrl || archiveThumbnailUrl;
 
   const handlePosterError = () => {
     setPosterError(true);
     setPosterLoaded(true);
-    // If both TMDB and archive image failed, report no image
-    if (tmdbChecked && !tmdbPosterUrl && !statusReported) {
-      onImageStatus?.(false);
-      setStatusReported(true);
-    }
   };
 
   const handlePosterLoad = () => {
     setPosterLoaded(true);
-    // Report successful image load
-    if (!statusReported) {
-      onImageStatus?.(true);
-      setStatusReported(true);
+  };
+
+  const handleKeyDown = (event) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      if (!event.repeat) onPlay?.(movie);
     }
   };
 
@@ -75,8 +52,12 @@ const MovieCard = memo(function MovieCard({ movie, tmdbEnabled = false, viewMode
   if (viewMode === 'grid') {
     return (
       <div
-        onClick={onPlay}
-        className="movie-card group block bg-gray-800 rounded-lg overflow-hidden hover:ring-2 hover:ring-yellow-400 transition-all cursor-pointer"
+        role="button"
+        tabIndex={0}
+        aria-label={`Open ${movie.title}`}
+        onKeyDown={handleKeyDown}
+        onClick={() => onPlay?.(movie)}
+        className="movie-card group block bg-gray-800 rounded-lg overflow-hidden hover:ring-2 hover:ring-yellow-400 transition-all cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-yellow-400"
         onMouseEnter={() => setIsHovered(true)}
         onMouseLeave={() => setIsHovered(false)}
       >
@@ -100,24 +81,8 @@ const MovieCard = memo(function MovieCard({ movie, tmdbEnabled = false, viewMode
               loading="lazy"
             />
           ) : tmdbChecked ? (
-            // No real poster: Archive.org thumbnails are a random frame, often cropped
-            // opening credits, so use it only as a blurred backdrop behind the title
-            <div className="absolute inset-0 bg-gray-800">
-              <img
-                src={archiveThumbnailUrl}
-                alt=""
-                className="w-full h-full object-cover blur scale-110 opacity-80"
-                onError={(e) => { e.target.style.display = 'none'; }}
-                loading="lazy"
-              />
-              <div className="absolute inset-0 bg-gradient-to-t from-gray-900 via-gray-900/40 to-transparent flex flex-col justify-end p-3">
-                <Film className="w-5 h-5 text-yellow-400 mb-2" />
-                <span className="text-base font-bold text-white leading-tight line-clamp-4">
-                  {movie.title}
-                </span>
-                {movie.year && <span className="text-xs text-gray-400 mt-1">{movie.year}</span>}
-              </div>
-            </div>
+            // No real poster: show a generated one rather than Archive.org's random video frame
+            <TitleCover movie={movie} />
           ) : null}
 
           {/* Hover overlay */}
@@ -185,29 +150,31 @@ const MovieCard = memo(function MovieCard({ movie, tmdbEnabled = false, viewMode
   // List view (detail-focused)
   return (
     <div
-      onClick={onPlay}
-      className="movie-card flex gap-4 p-3 bg-gray-800 rounded-lg hover:bg-gray-750 group transition-colors cursor-pointer"
+      role="button"
+      tabIndex={0}
+      aria-label={`Open ${movie.title}`}
+      onKeyDown={handleKeyDown}
+      onClick={() => onPlay?.(movie)}
+      className="movie-card flex gap-4 p-3 bg-gray-800 rounded-lg hover:bg-gray-750 group transition-colors cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-yellow-400"
     >
       {/* Thumbnail */}
       <div className="relative w-20 h-28 flex-shrink-0 bg-gray-700 rounded overflow-hidden">
-        {!posterLoaded && (
+        {(!tmdbChecked || (tmdbPosterUrl && !posterLoaded)) && (
           <div className="absolute inset-0 skeleton" />
         )}
 
-        {posterUrl && !posterError ? (
+        {tmdbPosterUrl && !posterError ? (
           <img
-            src={posterUrl}
+            src={tmdbPosterUrl}
             alt={movie.title}
             className={`w-full h-full object-cover ${posterLoaded ? 'opacity-100' : 'opacity-0'}`}
             onLoad={handlePosterLoad}
             onError={handlePosterError}
             loading="lazy"
           />
-        ) : (
-          <div className="absolute inset-0 flex items-center justify-center">
-            <ImageIcon className="w-6 h-6 text-gray-500" />
-          </div>
-        )}
+        ) : tmdbChecked ? (
+          <TitleCover movie={movie} size="thumb" />
+        ) : null}
 
         {tmdbData && (
           <div className="absolute top-1 right-1 bg-green-600 text-white text-[10px] px-1 rounded">

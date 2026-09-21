@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useId } from 'react';
 import {
   X,
   ExternalLink,
@@ -15,21 +15,24 @@ import {
 } from 'lucide-react';
 import tmdbService from '../services/tmdb';
 import archiveService from '../services/archive';
-
-const TMDB_API_KEY = import.meta.env.VITE_TMDB_API_KEY || '';
+import TitleCover from './TitleCover';
+import FilmPlayer from './FilmPlayer';
+import SearchBox from './SearchBox';
 
 // Sub-component for related movies with TMDB poster support
 function RelatedMovieCard({ movie, onClick }) {
-  const [posterUrl, setPosterUrl] = useState(movie.thumbnailUrl);
+  const [posterUrl, setPosterUrl] = useState(null);
+  const [posterFailed, setPosterFailed] = useState(false);
+  const [tmdbChecked, setTmdbChecked] = useState(false);
 
   useEffect(() => {
     // Try to get TMDB poster
-    tmdbService.searchMovie(movie.title, movie.year).then(data => {
+    tmdbService.searchMovie(movie.title, movie.year, movie.identifier).then(data => {
       if (data?.posterPath) {
         setPosterUrl(tmdbService.getPosterUrl(data.posterPath, 'small'));
       }
-    });
-  }, [movie.title, movie.year]);
+    }).finally(() => setTmdbChecked(true));
+  }, [movie.title, movie.year, movie.identifier]);
 
   const handleClick = (e) => {
     e.preventDefault();
@@ -48,14 +51,16 @@ function RelatedMovieCard({ movie, onClick }) {
       onKeyDown={(e) => e.key === 'Enter' && handleClick(e)}
     >
       <div className="relative aspect-[2/3] bg-gray-800 rounded-lg overflow-hidden mb-2">
-        <img
-          src={posterUrl}
-          alt={movie.title}
-          className="w-full h-full object-cover"
-          onError={(e) => {
-            e.target.src = movie.thumbnailUrl;
-          }}
-        />
+        {posterUrl && !posterFailed ? (
+          <img
+            src={posterUrl}
+            alt={movie.title}
+            className="w-full h-full object-cover"
+            onError={() => setPosterFailed(true)}
+          />
+        ) : tmdbChecked ? (
+          <TitleCover movie={movie} size="small" />
+        ) : null}
         <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity pointer-events-none">
           <Play className="w-10 h-10 text-yellow-400 fill-yellow-400" />
         </div>
@@ -70,12 +75,114 @@ function RelatedMovieCard({ movie, onClick }) {
   );
 }
 
-export default function MovieDetailPage({ movie, onClose, allMovies = [], onPlayRelated }) {
+export default function MovieDetailPage({ movie, onClose, allMovies = [], onPlayRelated, onSearch, onPickGenre, onPickCollection }) {
+  const [searchText, setSearchText] = useState('');
   const [tmdbData, setTmdbData] = useState(null);
   const [tmdbDetails, setTmdbDetails] = useState(null);
   const [loading, setLoading] = useState(true);
   const [isPlaying, setIsPlaying] = useState(false);
   const playerRef = React.useRef(null);
+  const onCloseRef = useRef(onClose);
+  const hasRenderedIdentifierRef = useRef(false);
+  const dialogRef = useRef(null);
+  const backButtonRef = useRef(null);
+  const titleId = useId();
+
+  // A native modal keeps background controls inert, including when focus
+  // enters the embedded player. Keep one focus session across related films.
+  useEffect(() => {
+    const opener = document.activeElement;
+    const dialog = dialogRef.current;
+    dialog.showModal();
+    backButtonRef.current.focus({ preventScroll: true });
+    return () => {
+      dialog.close();
+      if (opener?.isConnected) opener.focus({ preventScroll: true });
+    };
+  }, []);
+
+  // Selecting a related film can remove the focused card from the dialog.
+  useEffect(() => {
+    if (!dialogRef.current.contains(document.activeElement)) {
+      backButtonRef.current.focus({ preventScroll: true });
+    }
+  }, [movie.identifier]);
+
+  // Keep the page fixed while the full-screen overlay is displayed, and give
+  // this overlay session one history entry that the browser can return from.
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    if (!window.history.state?.movieDetail) {
+      // A shared URL is already a detail URL. Make its underlying history
+      // entry the browse page so closing the overlay also clears the hash.
+      if (window.location.hash) {
+        window.history.replaceState(
+          window.history.state,
+          '',
+          window.location.pathname + window.location.search
+        );
+      }
+      window.history.pushState(
+        { movieDetail: true, identifier: movie.identifier },
+        '',
+        `#${encodeURIComponent(movie.identifier)}`
+      );
+    }
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
+    };
+  }, []);
+
+  // Related movies reuse this overlay. Replace its one history entry instead
+  // of adding an entry for every related movie viewed.
+  useEffect(() => {
+    if (!hasRenderedIdentifierRef.current) {
+      hasRenderedIdentifierRef.current = true;
+      return;
+    }
+    window.history.replaceState(
+      { movieDetail: true, identifier: movie.identifier },
+      '',
+      `#${encodeURIComponent(movie.identifier)}`
+    );
+  }, [movie.identifier]);
+
+  onCloseRef.current = onClose;
+
+  // Closing always goes through history so the browser Back button, Escape,
+  // and the in-page button have identical behavior.
+  useEffect(() => {
+    const handlePopState = () => onCloseRef.current();
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
+
+  useEffect(() => {
+    const handleKeyDown = (event) => {
+      if (event.key !== 'Tab') return;
+      const dialog = dialogRef.current;
+      const controls = [...dialog.querySelectorAll(
+        'button, a[href], input, select, textarea, iframe, video[controls], [tabindex]'
+      )].filter((element) => element.tabIndex >= 0
+        && !element.matches(':disabled') && element.getClientRects().length);
+      const first = controls[0];
+      const last = controls[controls.length - 1];
+      // Native modality makes the background inert; explicitly wrap the
+      // endpoints as well so Tab does not leave for the browser toolbar.
+      if (event.shiftKey && (document.activeElement === first
+        || document.activeElement === dialog)) {
+        event.preventDefault();
+        last?.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first?.focus();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
 
   // Scroll to player when it opens
   useEffect(() => {
@@ -96,24 +203,15 @@ export default function MovieDetailPage({ movie, onClose, allMovies = [], onPlay
     setTmdbDetails(null);
 
     // Search for movie on TMDB
-    tmdbService.searchMovie(movie.title, movie.year).then(async (data) => {
+    tmdbService.searchMovie(movie.title, movie.year, movie.identifier).then(async (data) => {
       if (cancelled) return;
       setTmdbData(data);
 
       // If we found a match, fetch detailed info
       if (data?.id) {
-        try {
-          const detailsRes = await fetch(
-            `https://api.themoviedb.org/3/movie/${data.id}?api_key=${TMDB_API_KEY}&append_to_response=credits,similar,recommendations`
-          );
-          if (detailsRes.ok) {
-            const details = await detailsRes.json();
-            if (cancelled) return;
-            setTmdbDetails(details);
-          }
-        } catch (err) {
-          console.error('Failed to fetch TMDB details:', err);
-        }
+        const details = await tmdbService.getMovieDetails(data.id);
+        if (cancelled) return;
+        setTmdbDetails(details);
       }
       if (!cancelled) setLoading(false);
     });
@@ -135,12 +233,11 @@ export default function MovieDetailPage({ movie, onClose, allMovies = [], onPlay
 
   if (!movie) return null;
 
-  const embedUrl = `https://archive.org/embed/${movie.identifier}`;
   const posterUrl = tmdbData?.posterPath
     ? tmdbService.getPosterUrl(tmdbData.posterPath, 'large')
-    : movie.thumbnailUrl;
+    : null;
   const backdropUrl = tmdbDetails?.backdrop_path
-    ? `https://image.tmdb.org/t/p/w1280${tmdbDetails.backdrop_path}`
+    ? tmdbService.getBackdropUrl(tmdbDetails.backdrop_path, 'w1280')
     : null;
 
   const director = tmdbDetails?.credits?.crew?.find(c => c.job === 'Director');
@@ -148,7 +245,17 @@ export default function MovieDetailPage({ movie, onClose, allMovies = [], onPlay
   const genres = tmdbDetails?.genres || movie.genres?.map(g => ({ name: g })) || [];
 
   return (
-    <div className="fixed inset-0 z-50 bg-gray-900 overflow-y-auto">
+    <dialog
+      ref={dialogRef}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby={titleId}
+      onCancel={(event) => {
+        event.preventDefault();
+        window.history.back();
+      }}
+      className="fixed inset-0 z-50 m-0 h-full w-full max-h-none max-w-none border-0 p-0 bg-gray-900 overflow-y-auto"
+    >
       {/* Backdrop image */}
       {backdropUrl && (
         <div
@@ -161,22 +268,40 @@ export default function MovieDetailPage({ movie, onClose, allMovies = [], onPlay
 
       {/* Header */}
       <div className="sticky top-0 z-10 bg-gray-900/90 backdrop-blur border-b border-gray-800">
-        <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
+        <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between gap-3">
           <button
-            onClick={onClose}
-            className="flex items-center gap-2 text-gray-400 hover:text-white transition-colors"
+            ref={backButtonRef}
+            onClick={() => window.history.back()}
+            aria-label="Back to Browse"
+            className="flex items-center gap-2 text-gray-400 hover:text-white transition-colors flex-shrink-0"
           >
             <ChevronLeft className="w-5 h-5" />
-            <span>Back to Browse</span>
+            <span className="hidden md:inline">Back to Browse</span>
           </button>
+
+          {/* Search again without going back: a film opens here, anything else returns to the list */}
+          {onSearch && (
+            <div className="flex-1 flex max-w-2xl">
+              <SearchBox
+                value={searchText}
+                onChange={setSearchText}
+                onSearch={(text) => text.trim() && onSearch(text)}
+                onOpenFilm={(film) => { setSearchText(''); onPlayRelated(film); }}
+                onPickGenre={onPickGenre}
+                onPickCollection={onPickCollection}
+                movies={allMovies}
+              />
+            </div>
+          )}
 
           <a
             href={movie.archiveUrl}
             target="_blank"
             rel="noopener noreferrer"
-            className="flex items-center gap-2 text-sm text-gray-400 hover:text-yellow-400"
+            aria-label="View on Archive.org"
+            className="flex items-center gap-2 text-sm text-gray-400 hover:text-yellow-400 flex-shrink-0"
           >
-            View on Archive.org
+            <span className="hidden md:inline">View on Archive.org</span>
             <ExternalLink className="w-4 h-4" />
           </a>
         </div>
@@ -188,19 +313,22 @@ export default function MovieDetailPage({ movie, onClose, allMovies = [], onPlay
           {/* Poster */}
           <div className="flex-shrink-0 w-full lg:w-80">
             <div className="relative aspect-[2/3] bg-gray-800 rounded-lg overflow-hidden shadow-2xl">
-              {posterUrl && (
+              {posterUrl ? (
                 <img
                   src={posterUrl}
                   alt={movie.title}
                   className="w-full h-full object-cover"
                 />
-              )}
+              ) : !loading ? (
+                <TitleCover movie={movie} />
+              ) : null}
 
               {/* Play button overlay */}
               {!isPlaying && (
                 <button
                   onClick={() => setIsPlaying(true)}
-                  className="absolute inset-0 flex items-center justify-center bg-black/50 hover:bg-black/40 transition-colors group"
+                  aria-label={`Play ${movie.title}`}
+                  className="absolute inset-0 flex items-center justify-center bg-transparent hover:bg-black/40 focus-visible:bg-black/40 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-inset focus-visible:ring-yellow-400 transition-colors group"
                 >
                   <div className="w-20 h-20 rounded-full bg-yellow-500 flex items-center justify-center group-hover:scale-110 transition-transform">
                     <Play className="w-10 h-10 text-gray-900 fill-gray-900 ml-1" />
@@ -225,7 +353,7 @@ export default function MovieDetailPage({ movie, onClose, allMovies = [], onPlay
                   <div className="flex items-center justify-center gap-1 text-white">
                     <Clock className="w-5 h-5" />
                     <span className="text-xl font-bold">
-                      {tmdbDetails?.runtime || movie.runtimeMinutes}
+                      {tmdbDetails?.runtime || Math.round(movie.runtimeMinutes)}
                     </span>
                   </div>
                   <p className="text-xs text-gray-500 mt-1">Minutes</p>
@@ -237,7 +365,7 @@ export default function MovieDetailPage({ movie, onClose, allMovies = [], onPlay
           {/* Details */}
           <div className="flex-1 min-w-0">
             {/* Title */}
-            <h1 className="text-3xl lg:text-4xl font-bold text-white mb-2">
+            <h1 id={titleId} className="text-3xl lg:text-4xl font-bold text-white mb-2">
               {tmdbDetails?.title || movie.title}
             </h1>
 
@@ -313,7 +441,7 @@ export default function MovieDetailPage({ movie, onClose, allMovies = [], onPlay
                     <div key={actor.id} className="flex items-center gap-2 bg-gray-800 rounded-full pr-3">
                       {actor.profile_path ? (
                         <img
-                          src={`https://image.tmdb.org/t/p/w92${actor.profile_path}`}
+                          src={tmdbService.getProfileUrl(actor.profile_path)}
                           alt={actor.name}
                           className="w-8 h-8 rounded-full object-cover"
                         />
@@ -358,15 +486,11 @@ export default function MovieDetailPage({ movie, onClose, allMovies = [], onPlay
               </button>
             </div>
             <div className="relative aspect-video bg-black rounded-lg overflow-hidden shadow-2xl">
-              <iframe
-                src={embedUrl}
-                className="absolute inset-0 w-full h-full"
-                frameBorder="0"
-                allowFullScreen
-                allow="autoplay; fullscreen"
-                title={movie.title}
-              />
+              <FilmPlayer movie={movie} />
             </div>
+            <p className="mt-2 text-xs text-gray-500">
+              Keyboard: ← → skip 10 seconds (hold Shift for a minute), Space pauses, F is full screen, M mutes, Esc closes.
+            </p>
           </div>
         )}
 
@@ -389,6 +513,6 @@ export default function MovieDetailPage({ movie, onClose, allMovies = [], onPlay
           </div>
         )}
       </div>
-    </div>
+    </dialog>
   );
 }

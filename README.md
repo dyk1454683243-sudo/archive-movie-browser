@@ -1,6 +1,6 @@
 # Archive Movie Browser
 
-A modern, responsive web application for browsing and watching public domain movies from the Internet Archive. Features high-quality movie posters from TMDB, genre filtering, and an embedded video player.
+A modern, responsive web application for browsing and watching films hosted on the Internet Archive. Features high-quality movie posters from TMDB, genre filtering, and an embedded video player.
 
 <img width="1841" height="1294" alt="image" src="https://github.com/user-attachments/assets/cfe7ca9c-537c-4db3-9bb2-aebbffa3b083" />
 
@@ -13,19 +13,21 @@ It runs without any configuration. For movie posters, add `VITE_TMDB_API_KEY` in
 
 ## Features
 
-- **Browse Public Domain Films** - Access thousands of free, legal movies from Archive.org's collection
-- **High-Quality Posters** - Automatically matches movies with TMDB for professional movie posters
+- **Browse the Internet Archive's films** - A front end to Archive.org's video collections: it shows what Archive.org hosts, with better search, filtering and posters
+- **Real posters, no key needed** - A poster index maps messy Archive.org uploads to the real film, so most films show their TMDB poster with no API key; the rest get a designed cover
 - **Genre Filtering** - Filter by Horror, Sci-Fi, Comedy, Drama, and more
-- **Smart Search** - Search titles, subjects, and creators across every collection in the app at once
+- **Smart Search** - Suggestions as you type, matching titles, subjects, and creators across every collection at once
+- **Shareable views** - Filters, searches and films all live in the URL, so any view can be bookmarked or sent to a friend
 - **Embedded Player** - Watch movies directly in the browser without leaving the site
 - **Movie Details** - View cast, director, ratings, runtime, and plot synopsis
 - **Related Movies** - Discover similar films based on genre
-- **Responsive Design** - Works great on desktop and mobile devices
+- **Responsive Design** - Works great on desktop and mobile devices, keyboard and screen-reader accessible
+- **MCP server** - Let an AI assistant search and recommend the films ([mcp/](mcp/README.md))
 - **Persistent Cache** - TMDB data is cached locally for faster subsequent loads
 
 ## Tech Stack
 
-- **React 18** - Modern React with hooks
+- **React 19** - Modern React with hooks
 - **Vite** - Fast build tool and dev server
 - **Tailwind CSS** - Utility-first CSS framework
 - **Lucide React** - Beautiful icons
@@ -84,7 +86,7 @@ The built files will be in the `dist` directory.
 
 
 ### Browsing Movies
-- Use the genre pills to filter by category (default: Horror)
+- Use the genre pills to filter by genre across all the film collections
 - Toggle between "Full Movies" and "Shorts" for different content types
 - Adjust minimum runtime with the duration filter
 - Sort by popularity, rating, newest, or alphabetically
@@ -110,10 +112,10 @@ The built files will be in the `dist` directory.
 
 ### Without TMDB API Key
 
-The app works without a TMDB API key, but:
-- Movie posters will use Archive.org thumbnails (lower quality)
-- No TMDB ratings or additional metadata
-- No poster-based filtering
+The app works without a TMDB API key:
+- Films in the [poster index](#poster-index) still show their real poster; the rest get a generated cover
+- Films outside the index are not matched live, so fewer of them have posters
+- No cast, director or TMDB ratings on the detail page
 
 ## Project Structure
 
@@ -121,24 +123,38 @@ The app works without a TMDB API key, but:
 archive-movie-browser/
 ├── src/
 │   ├── components/
-│   │   ├── ArchiveMovieBrowser.jsx  # Main app component
+│   │   ├── ArchiveMovieBrowser.jsx  # Main app: filters, URL state, grid
+│   │   ├── SearchBox.jsx            # Search input with suggestions
 │   │   ├── MovieCard.jsx            # Movie card (grid/list)
-│   │   ├── MovieDetailPage.jsx      # Full movie detail view
-│   │   ├── VideoPlayerModal.jsx     # Video player modal
+│   │   ├── MovieDetailPage.jsx      # Film dialog with the player
+│   │   ├── TitleCover.jsx           # Generated poster for films without one
 │   │   └── SettingsModal.jsx        # Settings dialog
-│   ├── services/
-│   │   ├── archive.js               # Archive.org API service
-│   │   └── tmdb.js                  # TMDB API service with caching
-│   ├── App.jsx
-│   ├── main.jsx
-│   └── index.css
-├── .env.example
-├── .gitignore
-├── index.html
-├── package.json
-├── tailwind.config.js
+│   └── services/                    # No React or DOM: reusable, each with a *.test.js
+│       ├── archive.js               # Archive.org search, filtering, de-duplication
+│       ├── tmdb.js                  # TMDB lookups with a bounded cache
+│       ├── movieMatching.js         # Upload title -> film title candidates and matching
+│       ├── posterIndex.js           # Reads public/poster-index.json
+│       ├── suggest.js               # Search suggestions
+│       └── coverDesign.js           # Palette and shape for generated posters
+├── public/poster-index.json         # Which upload is which film, decided offline
+├── scripts/build-poster-index.mjs   # Builds the index (npm run index)
+├── mcp/                             # MCP server on top of src/services
+├── vercel.json                      # Security headers, including the CSP
 └── vite.config.js
 ```
+
+## Poster Index
+
+Archive.org titles are messy (`H 2 House On Haunted Hill ( 1959) Classic Vincent Price Horror Full Movie`), so matching them to TMDB in the browser misses a lot. `public/poster-index.json` holds decisions made offline instead: for the most-downloaded uploads in each film collection, which TMDB film it is, or that it is none. The app checks the index first, so indexed films get real posters **with no TMDB key and no TMDB requests**, and anything not indexed falls back to live matching.
+
+- Build or extend it with `npm run index` (options are in the header of `scripts/build-poster-index.mjs`). It needs a TMDB key and an OpenRouter key in `.env.local`; see `.env.example`. A decision is permanent per Archive.org identifier, so reruns only pay for new uploads. 750 uploads cost about 3 cents.
+- The decisions come from a small decision model (`typesafe/jev-1.13`), which picks among the TMDB candidates we fetch and reports a confidence. Below 0.7 the app shows the generated cover instead: a wrong poster is worse than none. On a hand-labelled set of 80 hard search results this got 67 right with 0 wrong posters, against 43 right and 5 wrong for the in-browser heuristics.
+- A scheduled workflow refreshes it weekly and pushes the result to a branch for review.
+- **Found a wrong poster?** Edit that identifier's entry in `public/poster-index.json` and open a PR. Setting it to `{ "n": 1, "c": 1, "m": 1 }` means "show the generated cover"; `"m": 1` marks an entry as corrected by hand, and the build script never overwrites those.
+
+## MCP Server
+
+`mcp/` is a [Model Context Protocol](https://modelcontextprotocol.io) server built on the same Archive.org code as the site, so an AI assistant can search the films, browse collections and hand back links that play. Four tools, no API keys. Setup for Claude Code, Claude Desktop and Cursor is in [mcp/README.md](mcp/README.md).
 
 ## Make It Yours
 
@@ -149,6 +165,10 @@ Fork it and turn it into your own themed archive: only westerns, only Prelinger 
 - **Genres** - edit `STANDARD_GENRES` and `GENRE_ALIASES` in `src/services/archive.js`.
 
 All Archive.org access goes through `src/services/archive.js`, which has no React or DOM dependencies, so it can be reused outside this app.
+
+## Privacy
+
+The live site uses [Vercel Web Analytics](https://vercel.com/docs/analytics): no cookies, no user identifiers, nothing sold or shared. It counts page views and a few events (a film opened or played, ten minutes watched, a search, a filter change) so we can tell whether people find and watch films. Search text is sent in lowercase, cut to 60 characters, with anything that looks like an email address removed. The code is in `src/services/analytics.js`; a fork only collects anything if its owner enables Web Analytics on their own Vercel project.
 
 ## API Credits
 
@@ -163,13 +183,30 @@ All Archive.org access goes through `src/services/archive.js`, which has no Reac
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request. Run `npm test` and `npm run build` before opening one.
+Contributions are welcome, from first-time contributors and from people who just love old films. Read [CONTRIBUTING.md](CONTRIBUTING.md) for setup, what to work on, and what review looks like. See the [CHANGELOG](CHANGELOG.md) for release history. Run `npm test` and `npm run build` before opening a pull request.
 
 1. Fork the repository
 2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
 3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
 4. Push to the branch (`git push origin feature/AmazingFeature`)
 5. Open a Pull Request
+
+## Contributors
+
+Thanks to everyone who has had a pull request merged:
+
+- [@dyk1454683243-sudo](https://github.com/dyk1454683243-sudo) - first outside contributor: the Shorts mode runtime control ([#21](https://github.com/amponce/archive-movie-browser/pull/21))
+- [@ruthikx](https://github.com/ruthikx) - Escape, Back button and scroll lock for the detail page, plus shareable `#identifier` links to any film ([#20](https://github.com/amponce/archive-movie-browser/pull/20))
+- [@mehul-vi](https://github.com/mehul-vi) - removed 174 lines of dead code ([#18](https://github.com/amponce/archive-movie-browser/pull/18))
+- [@fatihcvs](https://github.com/fatihcvs) - a long run of fixes across matching, accessibility and performance, including shared film links ([#48](https://github.com/amponce/archive-movie-browser/pull/48)), keyboard access to films ([#52](https://github.com/amponce/archive-movie-browser/pull/52)), screen-reader labels for the filters ([#53](https://github.com/amponce/archive-movie-browser/pull/53)), one TMDB service with a lean cache ([#51](https://github.com/amponce/archive-movie-browser/pull/51)), accurate poster matching ([#57](https://github.com/amponce/archive-movie-browser/pull/57)), evenly spaced TMDB requests ([#56](https://github.com/amponce/archive-movie-browser/pull/56)), a precise content blocklist ([#50](https://github.com/amponce/archive-movie-browser/pull/50)), a header and footer that follow what you're browsing ([#91](https://github.com/amponce/archive-movie-browser/pull/91)), a proper modal dialog for the detail page ([#94](https://github.com/amponce/archive-movie-browser/pull/94)), and [more](https://github.com/amponce/archive-movie-browser/pulls?q=is%3Apr+is%3Amerged+author%3Afatihcvs)
+- [@dw-dash-codes](https://github.com/dw-dash-codes) - the `TitleCover` component, so no view shows a raw Archive.org frame grab ([#54](https://github.com/amponce/archive-movie-browser/pull/54))
+- [@nightcityblade](https://github.com/nightcityblade) - detail page posters stay at full brightness, with a labelled, focusable play button ([#71](https://github.com/amponce/archive-movie-browser/pull/71))
+- [@karthikyannabthina](https://github.com/karthikyannabthina) - filters live in the URL, so any view can be shared and the Back button works ([#100](https://github.com/amponce/archive-movie-browser/pull/100))
+- [@Rokesh2008](https://github.com/Rokesh2008) - grid or list view is remembered between visits ([#110](https://github.com/amponce/archive-movie-browser/pull/110))
+- [@kante-Ramanaidu](https://github.com/kante-Ramanaidu) - on phones, the selected genre scrolls into view, so shared genre links look right ([#125](https://github.com/amponce/archive-movie-browser/pull/125))
+- [@MehulNegi](https://github.com/MehulNegi) - the project's changelog, from the first release on ([#141](https://github.com/amponce/archive-movie-browser/pull/141))
+
+Want to be next? Issues labelled [good first issue](https://github.com/amponce/archive-movie-browser/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are scoped, with file and line references.
 
 ## Acknowledgments
 

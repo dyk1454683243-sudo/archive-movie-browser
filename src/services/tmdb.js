@@ -1,10 +1,13 @@
 // TMDB API Service for movie poster matching
 // Get your API key at: https://www.themoviedb.org/settings/api
+import { cleanMovieTitle, selectMovieMatch, titleCandidates, filmYearFromTitle, bestStrictMatch } from './movieMatching.js';
+import { indexedMatch } from './posterIndex.js';
 
 const TMDB_API_BASE = 'https://api.themoviedb.org/3';
 const TMDB_IMAGE_BASE = 'https://image.tmdb.org/t/p';
 const CACHE_STORAGE_KEY = 'tmdb-poster-cache';
-const CACHE_VERSION = 1;
+export const MAX_CACHE_ENTRIES = 2000;
+export const CACHE_VERSION = 3; // bump when matching changes, so cached misses from the old logic are dropped
 
 // Poster sizes: w92, w154, w185, w342, w500, w780, original
 export const POSTER_SIZES = {
@@ -18,23 +21,47 @@ export const POSTER_SIZES = {
 let tmdbCache = new Map();
 const CACHE_DURATION = 1000 * 60 * 60 * 24 * 7; // 7 days for persistent cache
 
+// Expire entries independently and retain the newest writes when bounded.
+function pruneCache() {
+  const now = Date.now();
+  for (const [key, entry] of tmdbCache) {
+    const duration = key === 'genres' ? CACHE_DURATION * 24 : CACHE_DURATION;
+    if (!entry || !Number.isFinite(entry.timestamp) || now - entry.timestamp >= duration) {
+      tmdbCache.delete(key);
+    }
+  }
+  if (tmdbCache.size > MAX_CACHE_ENTRIES) {
+    const oldest = [...tmdbCache].sort((a, b) => a[1].timestamp - b[1].timestamp);
+    for (const [key] of oldest.slice(0, tmdbCache.size - MAX_CACHE_ENTRIES)) {
+      tmdbCache.delete(key);
+    }
+  }
+}
+
+function cacheEntry(key, data) {
+  tmdbCache.delete(key);
+  tmdbCache.set(key, { data, timestamp: Date.now() });
+  pruneCache();
+  debouncedSave();
+}
+
 // Pending requests tracker to prevent duplicate in-flight requests
 const pendingRequests = new Map();
 
 // Rate limiting
 let lastRequestTime = 0;
-const MIN_REQUEST_INTERVAL = 100; // ms between requests
+export const MIN_REQUEST_INTERVAL = 25; // ms between requests
 
 // Load cache from localStorage on init
 function loadCacheFromStorage() {
   try {
     const stored = localStorage.getItem(CACHE_STORAGE_KEY);
     if (stored) {
-      const { version, data, timestamp } = JSON.parse(stored);
-      // Check version and if cache is still valid (7 days)
-      if (version === CACHE_VERSION && Date.now() - timestamp < CACHE_DURATION) {
+      const { version, data } = JSON.parse(stored);
+      // Matching changes invalidate old versions; freshness belongs to each entry.
+      if (version === CACHE_VERSION && data && typeof data === 'object') {
         tmdbCache = new Map(Object.entries(data));
-        console.log(`Loaded ${tmdbCache.size} cached TMDB entries`);
+        pruneCache();
       } else {
         localStorage.removeItem(CACHE_STORAGE_KEY);
       }
@@ -47,18 +74,15 @@ function loadCacheFromStorage() {
 // Save cache to localStorage
 function saveCacheToStorage() {
   try {
+    pruneCache();
     const data = Object.fromEntries(tmdbCache);
     localStorage.setItem(CACHE_STORAGE_KEY, JSON.stringify({
       version: CACHE_VERSION,
-      timestamp: Date.now(),
       data
     }));
   } catch (e) {
-    // localStorage might be full, clear old entries
+    // Keep the previous persisted cache if storage is unavailable or full.
     console.warn('Failed to save TMDB cache:', e);
-    try {
-      localStorage.removeItem(CACHE_STORAGE_KEY);
-    } catch {}
   }
 }
 
@@ -86,15 +110,16 @@ class TMDBService {
 
   async throttledFetch(url) {
     const now = Date.now();
-    const timeSinceLastRequest = now - lastRequestTime;
+    // Reserve the slot before yielding so a batch cannot share one timer.
+    const requestTime = Math.max(now, lastRequestTime + MIN_REQUEST_INTERVAL);
+    lastRequestTime = requestTime;
 
-    if (timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
+    if (requestTime > now) {
       await new Promise(resolve =>
-        setTimeout(resolve, MIN_REQUEST_INTERVAL - timeSinceLastRequest)
+        setTimeout(resolve, requestTime - now)
       );
     }
 
-    lastRequestTime = Date.now();
     return fetch(url);
   }
 
@@ -116,27 +141,20 @@ class TMDBService {
 
   setCache(title, year, data) {
     const key = this.getCacheKey(title, year);
-    tmdbCache.set(key, {
-      data,
-      timestamp: Date.now()
-    });
-    // Save to localStorage (debounced)
-    debouncedSave();
+    cacheEntry(key, data);
   }
 
   // Clean movie title for better matching
   cleanTitle(title) {
-    return title
-      .replace(/\s*\(\d{4}\)\s*$/, '') // Remove year in parentheses
-      .replace(/\s*\[\d{4}\]\s*$/, '') // Remove year in brackets
-      .replace(/\s*-\s*\d{4}\s*$/, '') // Remove year after dash
-      .replace(/[^\w\s]/g, ' ') // Remove special characters
-      .replace(/\s+/g, ' ') // Normalize spaces
-      .trim();
+    return cleanMovieTitle(title);
   }
 
   // Search for a movie by title and optional year
-  async searchMovie(title, year = null) {
+  async searchMovie(title, year = null, identifier = null) {
+    // Decided offline for this Archive.org identifier? Then no TMDB request, and no key needed.
+    const indexed = await indexedMatch(identifier);
+    if (indexed !== undefined) return indexed;
+
     if (!this.enabled) return null;
 
     const cacheKey = this.getCacheKey(title, year);
@@ -168,47 +186,35 @@ class TMDBService {
   // Internal method to fetch from TMDB API
   async _fetchFromTMDB(title, year, cacheKey) {
     try {
-      const cleanedTitle = this.cleanTitle(title);
-      const params = new URLSearchParams({
-        api_key: this.apiKey,
-        query: cleanedTitle,
-        include_adult: false
-      });
-
-      if (year) {
-        params.append('year', year);
-      }
-
-      const response = await this.throttledFetch(
-        `${TMDB_API_BASE}/search/movie?${params}`
-      );
-
-      if (!response.ok) {
-        console.warn('TMDB search failed:', response.status);
-        this.setCache(title, year, null);
-        return null;
-      }
-
-      const data = await response.json();
-
-      // Find best match
+      // Try the tidied title, then guesses at the real title hidden in it (at most four
+      // requests, and only on a miss). The year is not sent: Archive.org years are often
+      // the upload year, so same-titled films are told apart by the closest year instead.
+      const filmYear = filmYearFromTitle(title) ?? year;
       let bestMatch = null;
-
-      if (data.results && data.results.length > 0) {
-        // Try to find exact or close title match
-        bestMatch = data.results.find(movie => {
-          const movieTitle = movie.title.toLowerCase();
-          const searchTitle = cleanedTitle.toLowerCase();
-          return movieTitle === searchTitle ||
-                 movieTitle.includes(searchTitle) ||
-                 searchTitle.includes(movieTitle);
+      const guesses = [];
+      for (const candidate of titleCandidates(title)) {
+        const params = new URLSearchParams({
+          api_key: this.apiKey,
+          query: candidate.query,
+          include_adult: false
         });
 
-        // If no good match, use first result if it has a poster
-        if (!bestMatch && data.results[0].poster_path) {
-          bestMatch = data.results[0];
+        const response = await this.throttledFetch(`${TMDB_API_BASE}/search/movie?${params}`);
+        if (!response.ok) {
+          // Not cached: an outage or rate limit must not hide this film's poster for a week
+          console.warn('TMDB search failed:', response.status);
+          return null;
         }
+
+        const data = await response.json();
+        const match = selectMovieMatch(data.results, candidate.query, filmYear, { strict: candidate.strict });
+        if (match && !candidate.strict) {
+          bestMatch = match;
+          break;
+        }
+        guesses.push(match);
       }
+      bestMatch = bestMatch || bestStrictMatch(guesses, filmYear);
 
       const result = bestMatch ? {
         id: bestMatch.id,
@@ -225,9 +231,78 @@ class TMDBService {
       return result;
     } catch (error) {
       console.error('TMDB search error:', error);
-      this.setCache(title, year, null);
       return null;
     }
+  }
+
+  // Get full movie details through the same cache and throttle as searches.
+  async getMovieDetails(id) {
+    if (!this.enabled) return null;
+
+    const cacheKey = `details:${id}`;
+    const cached = tmdbCache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+      return cached.data;
+    }
+
+    if (pendingRequests.has(cacheKey)) {
+      return pendingRequests.get(cacheKey);
+    }
+
+    const requestPromise = this._fetchMovieDetails(id, cacheKey);
+    pendingRequests.set(cacheKey, requestPromise);
+    try {
+      return await requestPromise;
+    } finally {
+      pendingRequests.delete(cacheKey);
+    }
+  }
+
+  async _fetchMovieDetails(id, cacheKey) {
+    try {
+      const params = new URLSearchParams({
+        api_key: this.apiKey,
+        append_to_response: 'credits'
+      });
+      const response = await this.throttledFetch(`${TMDB_API_BASE}/movie/${id}?${params}`);
+      if (!response.ok) {
+        console.warn('TMDB details failed:', response.status);
+        return null;
+      }
+
+      const details = await response.json();
+      // Persist only what MovieDetailPage displays; full responses can crowd
+      // the shared poster cache out of localStorage after a few detail views.
+      const fields = [
+        'title', 'tagline', 'overview', 'release_date', 'original_language',
+        'budget', 'vote_average', 'runtime', 'backdrop_path', 'genres',
+      ];
+      const data = Object.fromEntries(
+        fields.filter(field => field in details).map(field => [field, details[field]])
+      );
+      const director = details.credits?.crew?.find(person => person.job === 'Director');
+      data.credits = {
+        cast: details.credits?.cast?.slice(0, 6) || [],
+        crew: director ? [director] : [],
+      };
+      cacheEntry(cacheKey, data);
+      return data;
+    } catch (error) {
+      console.error('Failed to fetch TMDB details:', error);
+      return null;
+    }
+  }
+
+  // Rank one batch of films by TMDB rating, highest first. Every lookup finishes before the
+  // batch is ranked, so the order is final when it reaches the screen. Films with no rating
+  // (no match, or a failed lookup) follow in the order they came in.
+  async sortByRating(movies) {
+    const ratings = await Promise.all(movies.map(movie =>
+      this.searchMovie(movie.title, movie.year, movie.identifier).then(match => match?.voteAverage || 0, () => 0)));
+    return movies
+      .map((movie, index) => ({ movie, rating: ratings[index] }))
+      .sort((a, b) => b.rating - a.rating)
+      .map(entry => entry.movie);
   }
 
   // Get poster URL
@@ -242,23 +317,10 @@ class TMDBService {
     return `${TMDB_IMAGE_BASE}/${size}${backdropPath}`;
   }
 
-  // Batch search for multiple movies
-  async searchMovies(movies, onProgress = null) {
-    const results = new Map();
-    const total = movies.length;
-    let completed = 0;
-
-    for (const movie of movies) {
-      const result = await this.searchMovie(movie.title, movie.year);
-      results.set(movie.identifier, result);
-
-      completed++;
-      if (onProgress) {
-        onProgress(completed, total);
-      }
-    }
-
-    return results;
+  // Get cast profile URL
+  getProfileUrl(profilePath, size = 'w92') {
+    if (!profilePath) return null;
+    return `${TMDB_IMAGE_BASE}/${size}${profilePath}`;
   }
 
   // Get TMDB genres mapping
@@ -284,10 +346,7 @@ class TMDBService {
         genreMap[genre.id] = genre.name;
       });
 
-      tmdbCache.set('genres', {
-        data: genreMap,
-        timestamp: Date.now()
-      });
+      cacheEntry('genres', genreMap);
 
       return genreMap;
     } catch (error) {
@@ -298,21 +357,6 @@ class TMDBService {
 }
 
 // Export singleton instance
-export const tmdbService = new TMDBService(null);
-
-// Helper to check if a movie has a cached poster
-export function hasCachedPoster(title, year) {
-  const key = `${title.toLowerCase().trim()}-${year || 'unknown'}`;
-  const cached = tmdbCache.get(key);
-  if (cached && cached.data?.posterPath) {
-    return true;
-  }
-  // If we've checked and it has no poster, return false
-  if (cached && cached.data === null) {
-    return false;
-  }
-  // Not checked yet - return null (unknown)
-  return null;
-}
+export const tmdbService = new TMDBService(import.meta.env?.VITE_TMDB_API_KEY || '');
 
 export default tmdbService;
